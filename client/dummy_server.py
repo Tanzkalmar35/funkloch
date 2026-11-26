@@ -1,6 +1,8 @@
 import multiprocessing
 import socket
 
+from protocol import framing, request, response
+
 BUFFER_SIZE = 1024
 
 
@@ -8,9 +10,13 @@ def handle_tcp_client(client_socket: socket.socket, address: tuple[str, int]):
     print("[Dummy Server] Waiting for message")
     with client_socket:
         data = client_socket.recv(BUFFER_SIZE)
-        msg = data.decode()
-        print(f"[Dummy Server] Received {address[0]}:{address[1]}: '{msg.replace('\n', '\\n')}'")
-        client_socket.sendall(str.encode(f"OK:{msg}"))
+        msg: request.ChatMessage = framing.deserialize(data)
+        print(
+            f"[Dummy Server] Received {address[0]}:{address[1]}: "
+            f'"{msg.msg.replace("\n", "\\n")}" (chat_id={msg.chat_id}, user={msg.origin_id})'
+        )
+        response_msg = request.ChatMessage("*", "Server", f"OK:{msg}")
+        client_socket.sendall(framing.serialize(response_msg))
 
 
 def start_tcp_connection(ip_addr: str, port: int):
@@ -32,13 +38,16 @@ def start_udp_connection(ip_addr: str, udp_port: int, tcp_port: int):
     print(f"[Dummy Server] Receiving UDP packets at {ip_addr}:{udp_port}")
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    my_ip = socket.gethostbyname(socket.gethostname())
+
     server_socket.bind((ip_addr, udp_port))
 
     while True:
         data, client_address = server_socket.recvfrom(BUFFER_SIZE)
-        msg = data.decode()
-        print(f"[Dummy Server] Received {client_address[0]}:{client_address[1]}: '{msg.replace('\n', '\\n')}'")
-        server_socket.sendto(str.encode(f"Funkloch_Server_Accept_Client:{tcp_port}"), client_address)
+        request_msg: request.DiscoverServerRequest = framing.deserialize(data)
+        print(f"[Dummy Server] Received {client_address[0]}:{client_address[1]}: '{request_msg}'")
+        response_msg = response.DiscoverServerResponse(True, my_ip, tcp_port)
+        server_socket.sendto(framing.serialize(response_msg), client_address)
 
 
 def main() -> None:
