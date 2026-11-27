@@ -1,4 +1,5 @@
 import pickle
+import socket
 from typing import Any
 
 HEADER = b"Funkloch:"
@@ -28,3 +29,38 @@ def deserialize(data: bytes) -> Any:
         raise ValueError("Frame payload length does not match header")
 
     return pickle.loads(payload)
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading frame")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def recv_frame(sock: socket.socket) -> Any:
+    if _recv_exact(sock, len(HEADER)) != HEADER:
+        raise ValueError("Invalid frame header")
+
+    length_bytes = bytearray()
+    while True:
+        char = _recv_exact(sock, 1)
+        if char == b":":
+            break
+        if not char.isdigit() or len(length_bytes) >= 10:
+            raise ValueError("Invalid frame length")
+        length_bytes.extend(char)
+
+    try:
+        payload_length = int(length_bytes)
+    except ValueError as exc:
+        raise ValueError("Invalid frame length") from exc
+
+    if payload_length > MAX_FRAME_SIZE:
+        raise ValueError("Frame too large")
+
+    payload = _recv_exact(sock, payload_length)
+    return deserialize(HEADER + bytes(length_bytes) + b":" + payload)

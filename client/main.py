@@ -2,11 +2,15 @@ import copy
 import logging
 import os
 import socket
+import uuid
 from collections.abc import Callable
+from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any
 
 from protocol import framing, request, response
+
+REQUEST_TIMEOUT = 5.0
 
 
 def _set_logging_format():
@@ -29,10 +33,15 @@ class Client:
         self.client_tcp_socket: socket.socket | None = None
 
         self.on_message_callback: Callable[[request.ChatMessage], None] | None = None
+        self.on_message_event_callback: Callable[[response.MessageEvent], None] | None = None
 
         # TODO: necessary?
         self.chat_message_queue: list[request.ChatMessage] = []
         self.message_queue_lock: Lock = Lock()
+
+        self._pending: dict[str, Queue] = {}
+        self._pending_lock = Lock()
+        self._send_lock = Lock()
 
     def _discover_server(self, broadcast_ip: str, discovery_port: int, timeout_s: float) -> response.DiscoverServerResponse:
         BUFFER_SIZE = 1024
@@ -72,36 +81,90 @@ class Client:
                 self.on_message_callback(frame)
             with self.message_queue_lock:
                 self.chat_message_queue.append(frame)
+        elif isinstance(frame, response.MessageEvent):
+            if self.on_message_event_callback is not None:
+                self.on_message_event_callback(frame)
+        elif isinstance(frame, (response.MessageResponse, response.MessagesResponse)):
+            with self._pending_lock:
+                pending = self._pending.get(frame.request_id)
+            if pending is not None:
+                pending.put(frame)
+            else:
+                self.logger.warning(f"Unexpected response: {frame}")
         else:
             self.logger.warning(f"Frame handling not implemented for {frame}.")
 
     def _receive_loop(self):
-        BUFFER_SIZE = 1024  # TODO: use transmitted size
-
         assert self.client_tcp_socket is not None, "Socket not initialized. No TCP connection established."
 
         while True:
             try:
-                data = self.client_tcp_socket.recv(BUFFER_SIZE)
-                if len(data) > 0:
-                    try:
-                        frame = framing.deserialize(data)
-                        self.logger.info(f"Server Response: {frame}")
-                        self._handle_received_frame(frame)
-                    except ValueError as e:
-                        self.logger.error(f"Receive-loop received unrecognized message: {e}")  # TODO: propagate error
-                    except Exception as e:
-                        self.logger.error(f"Unexpected failure in receive-loop: {e}")  # TODO: propagate error
-            except OSError as e:
+                frame = framing.recv_frame(self.client_tcp_socket)
+            except Exception as e:
                 self.logger.error(f"Receive-loop stopped: {e}")  # TODO: propagate error
                 break
 
+            try:
+                self.logger.info(f"Server Response: {frame}")
+                self._handle_received_frame(frame)
+            except Exception as e:
+                self.logger.error(f"Unexpected failure in receive-loop: {e}")  # TODO: propagate error
+
     def _send_frame(self, frame: Any):
         assert self.client_tcp_socket is not None, "Socket not initialized. No TCP connection established."
-        self.client_tcp_socket.sendall(framing.serialize(frame))
+        with self._send_lock:
+            self.client_tcp_socket.sendall(framing.serialize(frame))
+
+    def _request(self, frame: Any) -> Any:
+        request_id = uuid.uuid4().hex
+        frame.request_id = request_id
+        reply: Queue = Queue()
+
+        with self._pending_lock:
+            self._pending[request_id] = reply
+
+        try:
+            self._send_frame(frame)
+            try:
+                return reply.get(timeout=REQUEST_TIMEOUT)
+            except Empty as exc:
+                raise TimeoutError(f"Request {request_id} timed out") from exc
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
 
     def send(self, chat_id: str, message: str):
         self._send_frame(request.ChatMessage(chat_id, self.username, message))
+
+    def create_message(self, chat_id: str, message: str) -> request.MessageRecord:
+        reply = self._request(
+            request.CreateMessageRequest("", chat_id, self.username, message)
+        )
+        if not reply.ok or reply.message is None:
+            raise RuntimeError(reply.error or "create_message failed")
+        return reply.message
+
+    def get_messages(self, chat_id: str) -> list[request.MessageRecord]:
+        reply = self._request(request.GetMessagesRequest("", chat_id))
+        if not reply.ok:
+            raise RuntimeError(reply.error or "get_messages failed")
+        return reply.messages
+
+    def update_message(self, message_id: str, message: str) -> request.MessageRecord:
+        reply = self._request(
+            request.UpdateMessageRequest("", message_id, self.username, message)
+        )
+        if not reply.ok or reply.message is None:
+            raise RuntimeError(reply.error or "update_message failed")
+        return reply.message
+
+    def delete_message(self, message_id: str) -> request.MessageRecord:
+        reply = self._request(
+            request.DeleteMessageRequest("", message_id, self.username)
+        )
+        if not reply.ok or reply.message is None:
+            raise RuntimeError(reply.error or "delete_message failed")
+        return reply.message
 
     def get_latest_messages(self) -> list[request.ChatMessage]:  # TODO: Add callback function?
         """If no callback is registered: deepcopy, return and clear and all received messages since the last call."""
@@ -116,6 +179,11 @@ class Client:
         """Add a function to be called after the reception of a chat message."""
 
         self.on_message_callback = on_message
+
+    def add_message_event_callback(self, on_event: Callable[[response.MessageEvent], None]):
+        """Add a function to be called after a message is created, updated or deleted."""
+
+        self.on_message_event_callback = on_event
 
     def _start_tcp_connection(self, server_ip: str, port: int):
         self.logger.info(f"Establishing TCP connection: {server_ip}:{port}")
@@ -155,6 +223,10 @@ class Client:
 
     def stop(self):
         if self.client_tcp_socket:
+            try:
+                self.client_tcp_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.client_tcp_socket.close()
 
 
