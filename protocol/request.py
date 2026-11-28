@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class Heartbeat:
     ok: bool
+
 
 @dataclass
 class ChatMessage:
@@ -10,20 +12,24 @@ class ChatMessage:
     origin_id: str
     msg: str
 
+
 @dataclass
 class JoinGroupRequest:
     chat_id: str
     origin_id: str
+
 
 @dataclass
 class LeaveGroupRequest:
     chat_id: str
     origin_id: str
 
+
 @dataclass
 class DiscoverServerRequest:
-    lat: str
-    long: str
+    lat: float
+    long: float
+
 
 @dataclass
 class RegisterNewUserRequest:
