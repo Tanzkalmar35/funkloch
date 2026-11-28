@@ -1,11 +1,14 @@
 import logging
+import os
 import socket
+import struct
 from threading import Event, Lock, Thread
 
 from protocol import framing, request, response
 from server.message_store import InMemoryMessageStore
 
 logger = logging.getLogger(__name__)
+SEND_TIMEOUT_S = 2.0
 
 
 class FunklochServer:
@@ -17,10 +20,6 @@ class FunklochServer:
         tcp_port: int = 5001,
     ):
         self.store = store
-        self.host = host
-        self._advertise_host = (
-            host if host != "0.0.0.0" else socket.gethostbyname(socket.gethostname())
-        )
 
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.bind((host, udp_port))
@@ -34,9 +33,9 @@ class FunklochServer:
         self.tcp_socket.listen()
         self.tcp_port = self.tcp_socket.getsockname()[1]
 
-        self._clients: set[socket.socket] = set()
+        self._clients: dict[socket.socket, Lock] = {}
         self._clients_lock = Lock()
-        self._send_lock = Lock()
+        self._send_timeout = SEND_TIMEOUT_S
         self._running = False
         self._threads: list[Thread] = []
 
@@ -72,12 +71,35 @@ class FunklochServer:
             except ValueError as exc:
                 logger.debug("Invalid discovery datagram from %s: %s", address, exc)
                 continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect(address)
+                    advertise_host = probe.getsockname()[0]
+            except OSError as exc:
+                logger.debug("Could not determine local address for %s: %s", address, exc)
+                continue
             self.udp_socket.sendto(
                 framing.serialize(
-                    response.DiscoverServerResponse(True, self._advertise_host, self.tcp_port)
+                    response.DiscoverServerResponse(True, advertise_host, self.tcp_port)
                 ),
                 address,
             )
+
+    def _set_send_timeout(self, client_socket: socket.socket):
+        try:
+            if os.name == "nt":
+                client_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_SNDTIMEO, int(self._send_timeout * 1000)
+                )
+            else:
+                timeout_us = int(self._send_timeout * 1_000_000)
+                client_socket.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_SNDTIMEO,
+                    struct.pack("ll", timeout_us // 1_000_000, timeout_us % 1_000_000),
+                )
+        except (OSError, TypeError):
+            pass
 
     def _serve_tcp(self):
         while self._running:
@@ -87,13 +109,14 @@ class FunklochServer:
                 continue
             except OSError:
                 break
+            self._set_send_timeout(client_socket)
             with self._clients_lock:
-                self._clients.add(client_socket)
+                self._clients[client_socket] = Lock()
             Thread(target=self._handle_client, args=(client_socket, address), daemon=True).start()
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]):
         logger.info("Client connected: %s:%s", *address)
-        with client_socket:
+        try:
             while self._running:
                 try:
                     frame = framing.recv_frame(client_socket)
@@ -104,72 +127,64 @@ class FunklochServer:
                     self._handle_frame(client_socket, frame)
                 except Exception:
                     logger.exception("Failed to handle frame from %s:%s", *address)
-        self._remove_client(client_socket)
+        finally:
+            self._remove_client(client_socket)
         logger.info("Client disconnected: %s:%s", *address)
 
     def _handle_frame(self, client_socket: socket.socket, frame):
         if isinstance(frame, request.CreateMessageRequest):
             record = self.store.create_message(frame.chat_id, frame.origin_id, frame.msg)
-            self._send(client_socket, response.MessageResponse(frame.request_id, True, record))
-            self._broadcast(response.MessageEvent("created", record), exclude=client_socket)
+            self._reply_mutation(client_socket, frame.request_id, "created", record)
         elif isinstance(frame, request.GetMessagesRequest):
             records = self.store.get_messages(frame.chat_id)
             self._send(client_socket, response.MessagesResponse(frame.request_id, True, records))
         elif isinstance(frame, request.UpdateMessageRequest):
             record = self.store.update_message(frame.message_id, frame.origin_id, frame.msg)
-            if record is None:
-                self._send(
-                    client_socket,
-                    response.MessageResponse(
-                        frame.request_id, False, error="message not found or not owned"
-                    ),
-                )
-                return
-            self._send(client_socket, response.MessageResponse(frame.request_id, True, record))
-            self._broadcast(response.MessageEvent("updated", record), exclude=client_socket)
+            self._reply_mutation(client_socket, frame.request_id, "updated", record)
         elif isinstance(frame, request.DeleteMessageRequest):
             record = self.store.delete_message(frame.message_id, frame.origin_id)
-            if record is None:
-                self._send(
-                    client_socket,
-                    response.MessageResponse(
-                        frame.request_id, False, error="message not found or not owned"
-                    ),
-                )
-                return
-            self._send(client_socket, response.MessageResponse(frame.request_id, True, record))
-            self._broadcast(response.MessageEvent("deleted", record), exclude=client_socket)
-        elif isinstance(frame, request.ChatMessage):
-            record = self.store.create_message(frame.chat_id, frame.origin_id, frame.msg)
-            self._send(client_socket, request.ChatMessage("*", "Server", f"OK:{frame}"))
-            self._broadcast(response.MessageEvent("created", record), exclude=client_socket)
+            self._reply_mutation(client_socket, frame.request_id, "deleted", record)
         else:
             logger.warning("Unsupported frame from client: %r", frame)
 
-    def _send(self, client_socket: socket.socket, frame) -> bool:
+    def _reply_mutation(self, client_socket, request_id: str, kind: str, record):
+        if record is None:
+            self._send(
+                client_socket,
+                response.MessageResponse(
+                    request_id, False, error="message not found or not owned"
+                ),
+            )
+            return
+        self._send(client_socket, response.MessageResponse(request_id, True, record))
+        self._broadcast(response.MessageEvent(kind, record), exclude=client_socket)
+
+    def _send_bytes(self, client_socket: socket.socket, data: bytes):
+        with self._clients_lock:
+            send_lock = self._clients.get(client_socket)
+        if send_lock is None:
+            return
         try:
-            with self._send_lock:
-                client_socket.sendall(framing.serialize(frame))
-            return True
+            with send_lock:
+                client_socket.sendall(data)
         except OSError:
             self._remove_client(client_socket)
-            return False
+
+    def _send(self, client_socket: socket.socket, frame):
+        self._send_bytes(client_socket, framing.serialize(frame))
 
     def _broadcast(self, frame, exclude: socket.socket | None = None):
         data = framing.serialize(frame)
         with self._clients_lock:
             clients = [client for client in self._clients if client is not exclude]
         for client in clients:
-            try:
-                with self._send_lock:
-                    client.sendall(data)
-            except OSError:
-                self._remove_client(client)
+            self._send_bytes(client, data)
 
     def _remove_client(self, client_socket: socket.socket):
         with self._clients_lock:
-            self._clients.discard(client_socket)
-        client_socket.close()
+            send_lock = self._clients.pop(client_socket, None)
+        if send_lock is not None:
+            client_socket.close()
 
 
 def main():

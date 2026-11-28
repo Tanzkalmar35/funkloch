@@ -63,4 +63,4 @@ def recv_frame(sock: socket.socket) -> Any:
         raise ValueError("Frame too large")
 
     payload = _recv_exact(sock, payload_length)
-    return deserialize(HEADER + bytes(length_bytes) + b":" + payload)
+    return pickle.loads(payload)

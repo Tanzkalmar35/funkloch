@@ -6,7 +6,7 @@ from protocol import framing, request, response
 
 class FramingTests(unittest.TestCase):
     def test_existing_round_trip(self):
-        frame = request.ChatMessage("chat", "user", "hello")
+        frame = request.DiscoverServerRequest()
         self.assertEqual(framing.deserialize(framing.serialize(frame)), frame)
 
     def test_crud_frames_round_trip(self):
@@ -25,7 +25,7 @@ class FramingTests(unittest.TestCase):
                 self.assertEqual(framing.deserialize(framing.serialize(frame)), frame)
 
     def test_recv_frame_handles_fragmentation(self):
-        frame = request.ChatMessage("chat", "user", "hello")
+        frame = request.CreateMessageRequest("r1", "chat", "user", "hello")
         data = framing.serialize(frame)
         sender, receiver = socket.socketpair()
         with sender, receiver:
@@ -34,14 +34,17 @@ class FramingTests(unittest.TestCase):
             self.assertEqual(framing.recv_frame(receiver), frame)
 
     def test_recv_frame_handles_large_payload(self):
-        frame = request.ChatMessage("chat", "user", "x" * 5000)
+        frame = request.CreateMessageRequest("r1", "chat", "user", "x" * 5000)
         sender, receiver = socket.socketpair()
         with sender, receiver:
             sender.sendall(framing.serialize(frame))
             self.assertEqual(framing.recv_frame(receiver), frame)
 
     def test_recv_frame_handles_concatenation(self):
-        frames = [request.ChatMessage("chat", "user", "one"), request.Heartbeat(True)]
+        frames = [
+            request.CreateMessageRequest("r1", "chat", "user", "one"),
+            request.GetMessagesRequest("r2", "chat"),
+        ]
         sender, receiver = socket.socketpair()
         with sender, receiver:
             sender.sendall(b"".join(framing.serialize(frame) for frame in frames))

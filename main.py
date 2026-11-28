@@ -1,6 +1,3 @@
-from tkinter import *
-
-# from tkinter import ttk
 import tkinter as tk
 
 
@@ -48,7 +45,6 @@ frame = tk.Frame(canvas)
 frame.pack(fill="x")
 
 window_id = canvas.create_window((0, 0), window=frame, anchor="nw")
-# canvas.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
 
 for i in range(30):

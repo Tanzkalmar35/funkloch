@@ -1,4 +1,0 @@
-[dependency-groups]
-default = [
-    "psutil>=7.2.2",
-]
