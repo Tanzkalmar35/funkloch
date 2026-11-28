@@ -32,3 +32,12 @@ coverage.xml
 
 # Secrets / local config
 .env
+
+# Local database files
+data/
+
+# Temporary files
+tmp/
+
+# Python cache
+__pycache__/
